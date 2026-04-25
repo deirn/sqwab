@@ -43,6 +43,10 @@ jobs:
         actions-cache-folder: ${{env.EM_CACHE_FOLDER}}
     - run: emcc -v
 
+    # Install wabt
+    - name: Install wabt
+      run: sudo apt-get install -y wabt
+
     # Unpack tarball
     - name: Unpack tarball
       run: curl ${{inputs.source_url}} | tar xzf -
