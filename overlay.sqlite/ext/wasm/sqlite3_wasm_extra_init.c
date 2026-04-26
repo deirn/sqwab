@@ -260,6 +260,8 @@ typedef struct {
     int nPos;
     int nAlloc;
     int bTokenized;
+    const char *pText;  /* NOT owned; valid for duration of aux function call */
+    int nText;
 } ColTokens;
 
 static int mcsrc_offsets_token_cb(void *pCtx, int tflags, const char *pToken,
@@ -279,14 +281,31 @@ static int mcsrc_offsets_token_cb(void *pCtx, int tflags, const char *pToken,
     return SQLITE_OK;
 }
 
-/* Returns a string of space-separated quads "col phrase byteoffset bytesize"
-** for each phrase match in the current row, mirroring FTS4 offsets(). */
+/* Returns records of "col phrase byteoffset bytesize snippet_length\nsnippet"
+** for each phrase match in the current row.
+** Parameters (all optional):
+**   pre      - string inserted before the matched token in the snippet (default "")
+**   post     - string inserted after the matched token in the snippet (default "")
+**   ellipsis - prefix/suffix when snippet does not reach the text boundary (default "...")
+**   maxToken - total tokens in context window around the match (default 11)
+*/
 static void mcsrc_offsets(const Fts5ExtensionApi *pApi,
                           Fts5Context *pFts,
                           sqlite3_context *pCtx,
                           int nVal,
                           sqlite3_value **apVal)
 {
+    const char *zPre = (nVal > 0) ? (const char*)sqlite3_value_text(apVal[0]) : "";
+    const char *zPost= (nVal > 1) ? (const char*)sqlite3_value_text(apVal[1]) : "";
+    const char *zEll = (nVal > 2) ? (const char*)sqlite3_value_text(apVal[2]) : "...";
+    int maxToken     = (nVal > 3) ? sqlite3_value_int(apVal[3]) : 11;
+    if (!zPre)  zPre  = "";
+    if (!zPost) zPost = "";
+    if (!zEll)  zEll  = "...";
+    if (maxToken <= 0) maxToken = 11;
+    int ctxPre  = (maxToken - 1) / 2;
+    int ctxPost = maxToken - 1 - ctxPre;
+
     int rc = SQLITE_OK;
     int nInst = 0;
     int nCol = 0;
@@ -310,6 +329,7 @@ static void mcsrc_offsets(const Fts5ExtensionApi *pApi,
     for (i = 0; i < nInst; i++) {
         int iPhrase, iCol, iOff;
         int byteStart, byteSize;
+        int rs, re;
 
         rc = pApi->xInst(pFts, i, &iPhrase, &iCol, &iOff);
         if (rc != SQLITE_OK) goto done;
@@ -320,6 +340,8 @@ static void mcsrc_offsets(const Fts5ExtensionApi *pApi,
             rc = pApi->xColumnText(pFts, iCol, &pText, &nText);
             if (rc != SQLITE_OK) goto done;
             if (pText && nText > 0) {
+                aCols[iCol].pText = pText;
+                aCols[iCol].nText = nText;
                 rc = pApi->xTokenize(pFts, pText, nText, &aCols[iCol],
                                      mcsrc_offsets_token_cb);
                 if (rc != SQLITE_OK && rc != SQLITE_DONE) goto done;
@@ -333,10 +355,45 @@ static void mcsrc_offsets(const Fts5ExtensionApi *pApi,
         byteStart = aCols[iCol].aPos[iOff].iStart;
         byteSize  = aCols[iCol].aPos[iOff].iEnd - aCols[iCol].aPos[iOff].iStart;
 
-        if (sqlite3_str_length(pStr) > 0) {
-            sqlite3_str_appendchar(pStr, 1, ' ');
+        /* Compute snippet window [rs, re) in token space around match at iOff */
+        rs = iOff - ctxPre;  if (rs < 0) rs = 0;
+        re = iOff + ctxPost + 1; if (re > aCols[iCol].nPos) re = aCols[iCol].nPos;
+
+        /* Build snippet into a temp str, then emit header + snippet */
+        {
+            sqlite3_str *pSnip = sqlite3_str_new(0);
+            if (!pSnip) { rc = SQLITE_NOMEM; goto done; }
+            if (aCols[iCol].pText && re > rs) {
+                const char *pTxt = aCols[iCol].pText;
+                TokenPos *aPos   = aCols[iCol].aPos;
+                /* leading ellipsis */
+                if (rs > 0) sqlite3_str_appendall(pSnip, zEll);
+                /* context before match */
+                if (rs < iOff)
+                    sqlite3_str_append(pSnip, pTxt + aPos[rs].iStart,
+                                       aPos[iOff].iStart - aPos[rs].iStart);
+                /* matched token wrapped with pre/post */
+                sqlite3_str_appendall(pSnip, zPre);
+                sqlite3_str_append(pSnip, pTxt + aPos[iOff].iStart,
+                                   aPos[iOff].iEnd - aPos[iOff].iStart);
+                sqlite3_str_appendall(pSnip, zPost);
+                /* context after match */
+                if (iOff + 1 < re)
+                    sqlite3_str_append(pSnip, pTxt + aPos[iOff].iEnd,
+                                       aPos[re - 1].iEnd - aPos[iOff].iEnd);
+                /* trailing ellipsis */
+                if (re < aCols[iCol].nPos) sqlite3_str_appendall(pSnip, zEll);
+            }
+            {
+                int nSnip = sqlite3_str_length(pSnip);
+                char *zSnip = sqlite3_str_finish(pSnip);
+                if (!zSnip) { rc = SQLITE_NOMEM; goto done; }
+                sqlite3_str_appendf(pStr, "%d %d %d %d %d\n",
+                                    iCol, iPhrase, byteStart, byteSize, nSnip);
+                sqlite3_str_append(pStr, zSnip, nSnip);
+                sqlite3_free(zSnip);
+            }
         }
-        sqlite3_str_appendf(pStr, "%d %d %d %d", iCol, iPhrase, byteStart, byteSize);
     }
 
 done:
